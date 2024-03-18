@@ -1,0 +1,503 @@
+---
+title: "ModQTL Mediation"
+author: "Katie Burnham"
+date: "28/06/2023"
+output: 
+  html_document:
+    code_folding: hide
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+library(data.table)
+library(vctrs)
+library(tidyverse)
+library(parallel)
+library(GenomicRanges)
+library(circlize)
+library(lme4)
+library(jtools)
+library(ggrepel)
+library(mediation)
+library(gridExtra)
+
+options(stringsAsFactors = FALSE)
+```
+
+Read in modQTL results and underlying data.
+
+```{r modqtl-results}
+mqtl.snp.table <- read.csv("../../nikhil/expression/eigengene_sva/mqtl_snp_table.csv")
+mqtl.snp.table <- subset(mqtl.snp.table, source == "Conditional cis-eQTL SNP")
+cond.snps <- unique(mqtl.snp.table$snps[which(mqtl.snp.table$source == "Conditional cis-eQTL SNP")])
+
+geno.bim <- fread("../../Genotyping/All_genotyping_merged_filtered_b38_refiltered_rsID.bim") %>%
+  as.data.frame()
+colnames(geno.bim) <- c("chr", "snps", "cM", "pos", "minor", "major")
+geno.bim$snps <- gsub(":", ".", geno.bim$snps)
+geno <- geno.bim
+colnames(geno) <- c("chr", "snp", "cM", "pos", "minor", "major")
+
+me.assocs <- do.call(rbind, lapply(list.files("../modqtl_rerun/", 
+                                              pattern="*_1.tsv"), function(file) {
+                                                file.full = paste0("../modqtl_rerun/", file)
+                                                me.assoc = fread(file.full, sep="\t", fill=TRUE) %>%
+                                                  as.data.frame() %>%
+                                                  dplyr::mutate(me = gsub("_1.tsv", "", file)) %>%
+                                                  dplyr::select(snp=1, beta=2, se=3, t=4, p=5, me)
+                                              }))
+
+# Genotype Matrix
+genotypes.file <- "../../nikhil/data/genotypes/eigengene_sva_genotypes.raw"
+genotypes <- fread(genotypes.file, sep=" ", drop=2:6)
+
+# Clean Genotype Matrix
+colnames(genotypes) <- gsub("X", "", colnames(genotypes))
+colnames(genotypes) <- sapply(strsplit(colnames(genotypes), "_"), function(x) x[1])
+genotypes[, 1] <- NULL
+colnames(genotypes) <- gsub(":", ".", colnames(genotypes))
+
+frqs <- apply(genotypes, 2, function(x){
+  as.data.frame(table(x))
+})
+
+freqs <- lapply(1:length(frqs), function(x){
+  frqs[[x]]$snp <- names(frqs[x])
+  return(frqs[[x]])
+})
+
+frqs <- rbindlist(freqs)
+frqsmin <- subset(frqs, x == 2)
+
+mqtl.snp.table$majorhoms <- frqs$Freq[match(mqtl.snp.table$snps, frqs$snp)]
+mqtl.snp.table$minorhoms <- frqsmin$Freq[match(mqtl.snp.table$snps, frqsmin$snp)]
+
+me.assocs$majorhoms <- frqs$Freq[match(me.assocs$snp, frqs$snp)]
+me.assocs$minorhoms <- frqsmin$Freq[match(me.assocs$snp, frqsmin$snp)]
+
+me.assocs <- subset(me.assocs, minorhoms > 3)
+
+mqtl.snp.table <- subset(mqtl.snp.table, minorhoms > 3)
+cond.snps <- unique(mqtl.snp.table$snps)
+
+# Significance: 0.05. We performed tests for 106 individual eigengenes for 12335 SNPs. 
+num.modules <- length(unique(me.assocs$me))
+num.snps <- length(unique(me.assocs$snp))
+
+mqtl.lead <- read.csv("../modqtl_rerun/updated_lead_mqtl.csv")
+mqtl.all <- read.csv("../modqtl_rerun/updated_all_mqtl.csv")
+
+# Module windows
+windows <- me.assocs %>%
+  dplyr::filter(p < 0.05 / (num.modules * num.snps)) %>%
+  merge(., geno, by="snp") %>%
+  dplyr::mutate(start = sapply(pos, function(x) { max(1, x - 10^6) }), end = pos + 10^6 - 1)
+
+windows.merged <- lapply(split(windows, windows$me), function(x) {
+  ranges <- makeGRangesFromDataFrame(x, seqnames.field="chr", start.field="start", end.field="end") %>%
+    reduce() %>%
+    as.data.frame()
+  ranges$me <- x$me[1]
+  return(ranges)
+}) %>%
+  do.call(rbind, .) %>%
+  makeGRangesFromDataFrame(keep.extra.columns=TRUE)
+
+geno.bim <- subset(geno.bim, snps %in% cond.snps)
+
+snp.ranges <- makeGRangesFromDataFrame(
+  as.data.frame(geno.bim), 
+  seqnames.field="chr", start.field="pos", end.field="pos", 
+  keep.extra.columns=TRUE
+)
+
+overlaps <- findOverlaps(windows.merged, snp.ranges)
+
+module.qtl.snps <- cbind(
+  as.data.frame(windows.merged)[overlaps@from,],
+  as.data.frame(snp.ranges)[overlaps@to,]
+) %>%
+  as.data.frame() %>%
+  dplyr::select(me, snps, chr=1, start=2, end=3) %>%
+  dplyr::mutate(QTL.ID=paste0(chr, ":", start, "-", end)) %>%
+  dplyr::select(ME=me, SNP=snps, QTL.ID)
+
+modules <- read.csv("../../nikhil/expression/gene_expression/modules.csv") %>%
+  dplyr::mutate(Eigengene=paste0("ME_", gsub(".*_", "", Module)))
+
+gene.info.circos <- read.table("gene_info_864_20412_hla.txt") %>%
+  dplyr::select(gene_id, seqnames, start, end, gene_name) %>%
+  dplyr::filter(seqnames %in% as.character(1:22)) %>%
+  dplyr::mutate(seqnames=factor(seqnames, levels=as.character(1:22)))
+
+connectivity <- read.csv("../../nikhil/expression/gene_expression/connectivity.csv")
+
+logcpm <- read.delim("../data/logcpm_864_20412_hla.txt")
+colnames(logcpm) <- gsub("GA", "", colnames(logcpm))
+
+eigengenes <- read.csv("../../nikhil/expression/gene_expression/eigengenes.csv")
+
+design.matrix <- read.csv("../modqtl_rerun/mapping_data.csv")
+genotypes <- fread("../../nikhil/data/genotypes/eigengene_sva_genotypes.raw", 
+                   sep=" ", drop=2:6)
+
+gene.info <- read.table("../data/gene_info_20412.txt") %>%
+  dplyr::select(gene_id, seqnames, start, end, gene_name)
+
+# Clean Genotype Matrix
+patient.sample.match <- match(design.matrix$GAinS.ID, genotypes$FID)
+genotypes <- genotypes[patient.sample.match, ]
+colnames(genotypes) <- gsub("X", "", colnames(genotypes))
+colnames(genotypes) <- sapply(strsplit(colnames(genotypes), "_"), function(x) x[1])
+genotypes[, 1] <- NULL
+genotypes <- as.matrix(genotypes)
+rownames(genotypes) <- design.matrix$Sample.ID
+
+genotype.ids <- colnames(genotypes)
+
+genotypes <- cbind(design.matrix, genotypes)
+all.vars <- colnames(design.matrix)
+eigens <- colnames(design.matrix)[grepl("^ME", colnames(design.matrix))]
+covs <- setdiff(setdiff(all.vars, eigens), c("Sample.ID", "GAinS.ID"))
+```
+
+For each module QTL, hold out each gene and retest to check if it's one gene
+driving the association versus the whole set of genes.
+
+```{r sensitivity}
+full.sensitivity.results <- list()
+
+# First set up main module QTL effect
+for (m in 1:32){
+  this.me <- mqtl.lead$me[m]
+  module.genes <- modules$Gene[modules$Eigengene == this.me]
+  module.gex <- t(logcpm[module.genes, ])
+  me <- eigengenes[, this.me]
+  
+  # genotypes
+  snp <- as.character(mqtl.lead$snp[m])
+  chr <- mqtl.lead$snp[m]
+  
+  variant.design <- genotypes[, c(paste0(this.me, "_1"), snp, covs, "GAinS.ID")]
+  variant.design <- variant.design[!is.na(variant.design[, snp]), ]
+  
+  colnames(variant.design)[2] <- "SNP"
+  
+  f.null <- as.formula(paste0(paste0(this.me, "_1"), "~", paste0(covs, collapse="+"), "+(1|GAinS.ID)"))
+  f.alt <- as.formula(paste0(paste0(this.me, "_1"), "~`", "SNP" , "`+", paste0(covs, collapse="+"), "+(1|GAinS.ID)"))
+  
+  # Now hold out each component gene in turn
+  n.genes <- length(module.genes)
+  sensitivity.results <- list()
+  
+  for(g in 1:n.genes){
+    new.module.gex <- module.gex[, -(g)]
+    module.svd <- svd(scale(new.module.gex))
+    new.me <- module.svd$u[match(rownames(variant.design), rownames(module.gex)), 1]
+    variant.design[, 1] <- new.me
+    
+    model.null <- lmer(f.null, data=variant.design, REML=FALSE)
+    model.test <- lmer(f.alt, data=variant.design, REML=FALSE)
+  
+    if (!all(complete.cases(variant.design[, "SNP"]))) {
+      model.null <- update(model.null, subset=complete.cases(variant.design[, "SNP"]))
+      model.test <- update(model.test, subset=complete.cases(variant.design[, "SNP"]))
+    }
+  
+  sensitivity.results[[g]] <- data.frame(matrix(data=c(summary(model.test)$coefficients[2, ],
+                                                       anova(model.null, model.test)["model.test", "Pr(>Chisq)"]),
+                                                nrow=1, ncol=4))
+  }
+  sensitivity.results <- data.frame(rbindlist(sensitivity.results))
+  sensitivity.results$gene.removed <- module.genes
+  sensitivity.results$module <- this.me
+  sensitivity.results$snp <- snp
+  
+  # eqtl.for.snp <- subset(mqtl.snp.table, snps == snp)
+  # this is lead SNP only
+  eqtl.for.snp <- subset(mqtl.snp.table, snps %in% mqtl.all$snp[which(mqtl.all$me == this.me & 
+                                                                        mqtl.all$chr == chr)])
+  # all associated SNPs' lead eGenes
+  sensitivity.results$egene <- sensitivity.results$gene.removed %in% eqtl.for.snp$egene
+  
+  full.sensitivity.results[[m]] <- sensitivity.results
+}
+
+full.sensitivity.results <- data.frame(rbindlist(full.sensitivity.results))
+full.sensitivity.results$genename <- gene.info$gene_name[match(full.sensitivity.results$gene.removed,
+                                                               gene.info$gene_id)]
+full.sensitivity.results$mqtl <- paste(full.sensitivity.results$module, full.sensitivity.results$snp)
+
+# pdf("../modqtl_rerun/ModQTL_sensitivity_analysis_allegenes.pdf", onefile = T, useDingbats = F)
+for(m in 1:32){
+  mod.i <- (full.sensitivity.results$module[!duplicated(full.sensitivity.results$mqtl)])[m]
+  snp <- (full.sensitivity.results$snp[!duplicated(full.sensitivity.results$mqtl)])[m]
+  
+  full.result <- mqtl.lead[which(mqtl.lead$me == mod.i & mqtl.lead$snp == snp), ]
+  sensitivity.results <- full.sensitivity.results[which(full.sensitivity.results$snp == snp & 
+                                                          full.sensitivity.results$module == mod.i), ]
+  
+  gg <- ggplot(sensitivity.results, aes(abs(X1), -log10(X4))) + 
+    geom_point(aes(colour=egene)) + theme_bw() +
+    geom_point(data=full.result, aes(abs(beta), -log10(p)), colour="black", shape=3) +
+    ggtitle(label = mod.i) +
+    geom_hline(yintercept = -log10(0.05 / (num.modules * num.snps)), lty=2) +
+    geom_text_repel(data=subset(sensitivity.results, X4 > (0.05 / (num.modules * num.snps)) |
+                                  egene == TRUE),
+              aes(label=genename))
+  
+  print(gg)
+}
+# dev.off()
+```
+
+Plot change in beta against gene's module connectivity/correlation with ME
+
+```{r connectivity-correlation}
+full.sensitivity.results$correlation <- NA
+for(i in 1:nrow(full.sensitivity.results)){
+  this.me <- full.sensitivity.results$module[i]
+  gene <- full.sensitivity.results$gene.removed[i]
+  m.g.corr <- cor(as.numeric(eigengenes[, this.me]),
+                                                 as.numeric(logcpm[gene, ]))
+  full.sensitivity.results$correlation[i] <- m.g.corr
+}
+
+# pdf("../modqtl_rerun/ModQTL_sensitivity_connectivity_analysis_allegeneslabelled.pdf", onefile = T, useDingbats = F)
+for(m in 1:32){
+  mod.i <- (full.sensitivity.results$module[!duplicated(full.sensitivity.results$mqtl)])[m]
+  snp <- (full.sensitivity.results$snp[!duplicated(full.sensitivity.results$mqtl)])[m]
+  
+  full.result <- mqtl.lead[which(mqtl.lead$me == mod.i & mqtl.lead$snp == snp), ]
+  sensitivity.results <- full.sensitivity.results[which(full.sensitivity.results$snp == snp & 
+                                                          full.sensitivity.results$module == mod.i), ]
+  
+  # add in connectivity/correlation info
+  
+  sensitivity.results$kWithin <- connectivity$kWithin[match(sensitivity.results$gene.removed, connectivity$X)]
+  gg <- ggplot(sensitivity.results, aes(kWithin, abs(X1)/abs(full.result$beta))) + 
+    geom_point(aes(colour=egene)) + theme_bw() +
+    ggtitle(label = mod.i, subtitle = "Which genes, when excluded, lead to a non-significant modQTL?") +
+    geom_hline(yintercept = 1, lty=2) +
+    geom_text_repel(data=subset(sensitivity.results, X4 > (0.05 / (num.modules * num.snps))),
+              aes(label=genename)) +
+    ylab("Change in modQTL beta when gene removed")
+  
+  print(gg)
+  
+  gg <- ggplot(sensitivity.results, aes(abs(correlation), abs(X1)/abs(full.result$beta))) + 
+    geom_point(aes(colour=egene)) + theme_bw() +
+    ggtitle(label = mod.i, subtitle = "Which genes, when excluded, lead to a non-significant modQTL?") +
+    geom_hline(yintercept = 1, lty=2) +
+    geom_text_repel(data=subset(sensitivity.results, X4 > (0.05 / (num.modules * num.snps))),
+              aes(label=genename)) +
+    ylab("Change in modQTL beta when gene removed")
+  
+  print(gg)
+}
+# dev.off()
+```
+
+For each module QTL, hold out all egenes (lead eGenes for all associated SNPs) 
+and retest to check if it's these genes collectively driving the association versus 
+the whole set of genes.
+
+Save the updated ME
+
+```{r sensitivity}
+full.sensitivity.results <- list()
+new.mes <- list()
+
+pdf("../modqtl_rerun/sensitivity_allegenes_boxplots.pdf", onefile=T, useDingbats=F)
+# First set up main module QTL effect
+for (m in 1:32){
+  module <- mqtl.lead$me[m]
+  module.genes <- modules$Gene[modules$Eigengene == module]
+  module.gex <- t(logcpm[module.genes, ])
+  me <- eigengenes[, module]
+  
+  # genotypes
+  snp <- as.character(mqtl.lead$snp[m])
+  chr <- mqtl.lead$chr[m]
+  
+  variant.design <- genotypes[, c(paste0(module, "_1"), snp, covs, "GAinS.ID")]
+  variant.design <- variant.design[!is.na(variant.design[, snp]), ]
+  
+  colnames(variant.design)[2] <- "SNP"
+  
+  f.null <- as.formula(paste0(paste0(module, "_1"), "~", paste0(covs, collapse="+"), "+(1|GAinS.ID)"))
+  f.alt <- as.formula(paste0(paste0(module, "_1"), "~`", "SNP" , "`+", paste0(covs, collapse="+"), "+(1|GAinS.ID)"))
+  
+  # Now hold out all eqtl (whole locus)
+  # egenes <- subset(all.eqtl, SNP == snp)
+  egenes <- subset(mqtl.snp.table, snps %in% mqtl.all$snp[which(mqtl.all$me == module &
+                                                                  mqtl.all$chr == chr)])
+  new.module.gex <- module.gex[, !(colnames(module.gex) %in% egenes$egene)]
+  module.svd <- svd(scale(new.module.gex))
+  new.me <- module.svd$u[match(rownames(variant.design), rownames(module.gex)), 1]
+  new.mes[[m]] <- new.me
+  
+  # correlation between full and minimal ME
+  me.corr <- cor(variant.design[, 1], new.me)
+  plot(variant.design[, 1], new.me)
+  variant.design[, 1] <- new.me
+    
+  model.null <- lmer(f.null, data=variant.design, REML=FALSE)
+  model.test <- lmer(f.alt, data=variant.design, REML=FALSE)
+  
+  if (!all(complete.cases(variant.design[, "SNP"]))) {
+    model.null <- update(model.null, subset=complete.cases(variant.design[, "SNP"]))
+    model.test <- update(model.test, subset=complete.cases(variant.design[, "SNP"]))
+  }
+  
+  sensitivity.results <- data.frame(matrix(data=c(me.corr, summary(model.test)$coefficients[2, ],
+                                                  anova(model.null, model.test)["model.test", "Pr(>Chisq)"]),
+                                           nrow=1, ncol=5))
+# X1 == correlation, X2=beta, X3=SE, X4=stat, X5=p value
+    print(effect_plot(model.test,
+                    pred="SNP", x.label=snp,
+                    interval = TRUE,
+                    plot.points = TRUE,
+                    main.title = module,
+                    jitter=c(0.1, 0),
+                    partial.residuals=TRUE) +
+          theme_bw() +
+            scale_x_continuous(breaks=c(0, 1, 2)))
+
+  sensitivity.results$module <- module
+  sensitivity.results$snp <- snp
+  full.sensitivity.results[[m]] <- sensitivity.results
+}
+dev.off()
+
+full.sensitivity.results <- rbindlist(full.sensitivity.results)
+colnames(full.sensitivity.results) <- c("ME_correlation", "beta", "se", "t", "p", 
+                                        "module", "snp")
+full.sensitivity.results$full.result <- mqtl.lead$beta
+full.sensitivity.results$full.result.p <- mqtl.lead$p
+
+full.sensitivity.results$significant <- (full.sensitivity.results$p < (0.05 / (num.modules * num.snps)))
+
+p1 <- ggplot(full.sensitivity.results, aes(abs(full.result), abs(beta))) + 
+  geom_point(aes(colour=significant)) + 
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  xlab("Absolute beta from modQTL") +
+  ylab("Absolute beta when all eGenes are dropped from the ME") +
+  xlim(c(0, 0.06)) +
+  ylim(c(0, 0.06)) +
+  geom_abline(intercept=0, slope=1) +
+  geom_text_repel(data=subset(full.sensitivity.results, significant == TRUE),
+                  aes(label=module))
+
+p2 <- ggplot(full.sensitivity.results, aes(-log10(full.result.p), -log10(p))) + 
+  geom_point(aes(colour=significant)) + 
+  theme_bw() +
+  xlab("p value from modQTL") +
+  ylab("p value when all eGenes are dropped from the ME") +
+  geom_abline(intercept=0, slope=1) +
+  geom_text_repel(data=subset(full.sensitivity.results, significant == TRUE),
+                  aes(label=module))
+
+# pdf("../modqtl_rerun/FigS19_sensitivity_remove_eGenes.pdf", useDingbats = F, onefile = T)
+print(p1)
+print(p2)
+# dev.off()
+
+full.sensitivity.results <- subset(full.sensitivity.results, significant == TRUE)
+full.sensitivity.results$pair <- paste0(full.sensitivity.results$snp, full.sensitivity.results$module)
+
+names(new.mes) <- mqtl.lead$me
+mqtl.lead <- subset(mqtl.lead, pair %in% full.sensitivity.results$pair)
+new.mes <- new.mes[match(mqtl.lead$me, names(new.mes))]
+```
+
+Mediation analysis on these 7 signals only, to test if the cis-eGene mediates the
+association between the eSNP and the rest of the module:
+
+```{r mediation}
+mediation.results <- list()
+# Test every eGene against the ME without eGenes included
+module <- mqtl.lead$me[1] # test
+
+pdf("../modqtl_rerun/FigS20_mediation_results.pdf", onefile=T, useDingbats=F)
+for (module in mqtl.lead$me[1:nrow(mqtl.lead)]){
+  this.me <- module
+  snp <- as.character(mqtl.lead$snp[match(module, mqtl.lead$me)])
+  chr <- as.character(mqtl.lead$chr[match(module, mqtl.lead$me)])
+  
+  # lead eGenes for all modQTL SNPs
+  egenes <- mqtl.snp.table$egene[which(mqtl.snp.table$snps %in% mqtl.all$snp[which(mqtl.all$me == module &
+                                                                                     mqtl.all$chr == chr)])]
+  egene.gex <- t(logcpm[egenes, ])
+  me <- eigengenes[, module]
+  new.me <- new.mes[[module]]
+  
+  variant.design <- genotypes[, c(snp, covs, "GAinS.ID")]
+  variant.design <- variant.design[!is.na(variant.design[, snp]), ]
+  df <- data.frame(new.me, egene.gex[match(rownames(variant.design), rownames(egene.gex)), ])
+  variant.design$New_ME <- new.me
+  colnames(variant.design)[1] <- "SNP"
+  
+  # plot.new()
+  results <- list()
+  
+  # Testing eGene as a mediator of SNP effect (snp) on module eigengene
+  set.seed("310323")
+  
+  # for each egene
+  for(egene in egenes){
+    
+    # Total effect
+      formula.totaleffect <- as.formula(paste0("New_ME", "~`", "SNP" , "`+", paste0(covs, collapse="+"), "+(1|GAinS.ID)"))
+      
+      fit.totaleffect <- lmer(formula.totaleffect, data=variant.design, REML=FALSE)
+    
+      results[[egene]] <- data.frame(matrix(data=
+          c(summary(fit.totaleffect)$coefficients["SNP", ], "NA", "NA"),
+        nrow=1, ncol=5), row.names = gene)
+    
+      # SNP on egene (mediator effect)
+      variant.design.2 <- variant.design
+      variant.design.2$egene <- df[match(rownames(variant.design), rownames(df)), egene]
+      formula.mediator <- as.formula(paste0("egene", "~`", "SNP" , "`+", paste0(covs, collapse="+"), "+(1|GAinS.ID)"))
+      fit.mediator <- lmer(formula.mediator, data=variant.design.2, REML=FALSE)
+      
+      # Direct effect
+      formula.dv <- as.formula(paste0("New_ME", "~`", "SNP" , 
+                                      "`+", paste0(c("egene", covs), collapse="+"), "+(1|GAinS.ID)"))
+      fit.dv <- lmer(formula.dv, data=variant.design.2, REML=FALSE)
+      resultsmed = mediate(fit.mediator, fit.dv, treat='SNP', mediator='egene', 
+                           # treat.value=1, control.value=0,
+                           # treat.value=2, control.value=1,
+                           # treat.value=2, control.value=0,
+                           boot=F, sims=1000, covs=covs, long=FALSE)
+      print(gene.info$gene_name[which(gene.info$gene_id == egene)])
+      print(summary(resultsmed))
+      print(summary(model.test)$coefficients["SNP", ])
+      plot(resultsmed, main=(gene.info$gene_name[which(gene.info$gene_id == egene)]))
+      results[[egene]][, 4] <- summary(resultsmed)$d.avg.p
+      results[[egene]][, 5] <- summary(resultsmed)$n.avg
+      results[[egene]]$egene <- egene
+  }
+  
+  results <- do.call(rbind, results)
+  results$kIn <- connectivity$kWithin[match(rownames(results), connectivity$X)]
+  results$correlation <- full.sensitivity.results$ME_correlation[match(module, full.sensitivity.results$module)]
+  results$egenename <- gene.info$gene_name[match(rownames(results), gene.info$gene_id)]
+  results$genechr <- gene.info$seqnames[match(rownames(results), gene.info$gene_id)]
+  results$local <- results$genechr == mqtl.lead$chr[match(module, mqtl.lead$me)]
+  mediation.results[[module]] <- results
+}
+dev.off()
+
+for(i in 1:7){
+  mediation.results[[i]]$module <- names(mediation.results[i])
+}
+
+mediation.results.all <- rbindlist(mediation.results)
+mediation.results.all$Mediation <- as.factor(mediation.results.all$X4 < 0.05/7)
+# save(mediation.results.all,
+#      file="../modqtl_rerun/mediation.results.all.covs.Rda")
+```

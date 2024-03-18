@@ -1,0 +1,6 @@
+# Module QTL
+
+This work was done by Nikhil Milind as part of his MPhil. Full scripts (here:)[https://github.com/davenportlab/eQTL_pQTL_Characterization/blob/main/04_Expression#preparation-for-module-qtl-mapping]
+
+For this paper, the QTL mapping was restricted to SNPs for which a cis-eQTL had
+been observed.
