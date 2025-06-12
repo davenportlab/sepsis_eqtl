@@ -129,7 +129,7 @@ results <- do.call(rbind, lapply(irange, function(i){
                                   ))
       check.sig <- anova(model.null.subset, model.test.subset)$'Pr(>Chisq)'[2] < threshold
     }
-    check.sig <- TRUE
+    # check.sig <- TRUE
     if(check.sig == TRUE){
       
       model.null <- lmer(exp[pairs.int[i, 1], ] ~
