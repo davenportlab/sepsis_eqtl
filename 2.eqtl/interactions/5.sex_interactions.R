@@ -61,7 +61,7 @@ results <- do.call(rbind, lapply(irange, function(i){
         check.sig <- anova(model.null.subset, model.test.subset)$'Pr(>Chisq)'[2] < threshold
       }
     # if still significant
-    check.sig <- TRUE
+    # check.sig <- TRUE
     if(check.sig){
       model.null <- lmer(exp[pairs.int[i, 1], ] ~
                            geno.int[, pairs.int[i, 2]] +
