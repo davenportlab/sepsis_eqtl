@@ -82,8 +82,10 @@ snp.info <- data.frame(fread("../data/genotyping_for_rna-seq_eQTL.bim",
 genes <- read.delim("../data/gene_info_20412.txt", stringsAsFactors = F)
 
 # flip start and end for genes on - strand
-genes$start[which(genes$strand == "-")] <- genes$end[which(genes$strand == "-")]
-genes$end[which(genes$strand == "-")] <- genes$start[which(genes$strand == "-")]
+is_neg <- genes$strand == "-"
+tmp <- genes$start[is_neg]
+genes$start[is_neg] <- genes$end[is_neg]
+genes$end[is_neg] <- tmp
 
 # divide up genes and SNPs by chromosome
 genes.list <- vector("list", 22)
